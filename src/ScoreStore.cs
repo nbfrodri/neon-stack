@@ -17,6 +17,7 @@ namespace NeonStack
         [DataMember] public int Level;
         [DataMember] public int Lines;
         [DataMember] public DateTime Date;
+        [DataMember] public long? Milliseconds;
     }
 
     [DataContract]
@@ -28,6 +29,11 @@ namespace NeonStack
         [DataMember] public bool Muted;
         [DataMember] public bool Compact;
         [DataMember] public bool OnTop;
+        [DataMember] public bool Sprint;
+        [DataMember] public bool? ShowGhost;
+        [DataMember] public List<ScoreEntry> SprintEntries = new List<ScoreEntry>();
+        [DataMember] public WindowPlacement FullWindow;
+        [DataMember] public WindowPlacement CompactWindow;
     }
 
     public sealed class ScoreStore
@@ -41,13 +47,13 @@ namespace NeonStack
         public ScoreStore(string directory)
         {
             FilePath = Path.Combine(directory, "scores.json"); Data = new ScoreData();
-            if (!File.Exists(FilePath)) return;
+            if (!File.Exists(FilePath) && !File.Exists(FilePath + ".bak")) return;
             try { Data = Read(FilePath); }
             catch (Exception ex)
             {
                 if (!IsStorageError(ex)) throw;
-                corruptPrimary = true;
-                Notice = "Archivo dañado. Récords nuevos disponibles.";
+                corruptPrimary = File.Exists(FilePath);
+                Notice = corruptPrimary ? "Archivo dañado. Récords nuevos disponibles." : "No se pudo recuperar la copia de récords.";
                 try { Data = Read(FilePath + ".bak"); Notice = "Récords recuperados de la copia de seguridad."; }
                 catch (Exception backupEx) { if (!IsStorageError(backupEx)) throw; }
             }
@@ -75,6 +81,9 @@ namespace NeonStack
                 data.Entries = data.Entries.Where(e => e != null && e.Score >= 0 && e.Level >= 1 && e.Lines >= 0)
                     .OrderByDescending(e => e.Score).ThenBy(e => e.Date).Take(20).ToList();
                 foreach (ScoreEntry entry in data.Entries) entry.Initials = NormalizeInitials(entry.Initials);
+                data.SprintEntries = (data.SprintEntries ?? new List<ScoreEntry>()).Where(e => e != null && e.Milliseconds > 0 && e.Lines >= 40)
+                    .OrderBy(e => e.Milliseconds).ThenBy(e => e.Date).Take(20).ToList();
+                foreach (ScoreEntry entry in data.SprintEntries) entry.Initials = NormalizeInitials(entry.Initials);
                 return data;
             }
         }
@@ -91,6 +100,22 @@ namespace NeonStack
         public bool Rename(ScoreEntry entry, string initials)
         {
             entry.Initials = NormalizeInitials(initials); Data.LastInitials = entry.Initials; return Save();
+        }
+
+        public ScoreEntry AddSprint(long milliseconds, int score, int level, int lines)
+        {
+            if (milliseconds <= 0 || lines < 40) throw new ArgumentException("Only completed runs with a positive time can be ranked.");
+            ScoreEntry entry = new ScoreEntry { Id = Guid.NewGuid().ToString("N"), Initials = Data.LastInitials,
+                Milliseconds = milliseconds, Score = score, Level = level, Lines = lines, Date = DateTime.Now };
+            Data.SprintEntries.Add(entry);
+            Data.SprintEntries = Data.SprintEntries.OrderBy(e => e.Milliseconds).ThenBy(e => e.Date).Take(20).ToList();
+            Save(); return entry;
+        }
+
+        public static string FormatTime(long milliseconds)
+        {
+            milliseconds = Math.Max(0, milliseconds);
+            return (milliseconds / 60000).ToString("D2") + ":" + ((milliseconds / 1000) % 60).ToString("D2") + "." + (milliseconds % 1000).ToString("D3");
         }
 
         public bool Save()

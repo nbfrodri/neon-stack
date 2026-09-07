@@ -3,7 +3,8 @@ using System.Collections.Generic;
 
 namespace NeonStack
 {
-    public enum Phase { Ready, Playing, Paused, GameOver }
+    public enum Phase { Ready, Playing, Paused, GameOver, Completed }
+    public enum GameMode { Classic, Sprint40 }
 
     public struct Cell
     {
@@ -18,6 +19,9 @@ namespace NeonStack
         public const int MaxLockResets = 6;
         public readonly int[,] Board = new int[Height, Width];
         public Phase State { get; private set; }
+        public GameMode Mode { get; private set; }
+        public double ElapsedSeconds { get; private set; }
+        public int RemainingLines { get { return Math.Max(0, 40 - Lines); } }
         public int Kind { get; private set; }
         public int Rotation { get; private set; }
         public int X { get; private set; }
@@ -94,7 +98,15 @@ namespace NeonStack
         {
             Array.Clear(Board, 0, Board.Length);
             Score = Lines = Pieces = 0;
+            ElapsedSeconds = 0;
             queue.Clear(); FillQueue(); State = Phase.Playing; Spawn();
+        }
+
+        public void SelectMode(GameMode mode)
+        {
+            if (State == Phase.Playing || State == Phase.Paused) return;
+            Mode = mode; State = Phase.Ready; Score = Lines = Pieces = 0; ElapsedSeconds = 0;
+            Array.Clear(Board, 0, Board.Length);
         }
 
         private void Spawn()
@@ -175,9 +187,11 @@ namespace NeonStack
             int target = GhostY; Score += (target - Y) * 2; Y = target; Lock();
         }
 
-        public void Tick(double elapsed)
+        public void Tick(double elapsed, double simulationLimit = double.MaxValue)
         {
-            if (State != Phase.Playing || elapsed <= 0) return;
+            if (State != Phase.Playing || elapsed <= 0 || double.IsNaN(elapsed) || double.IsInfinity(elapsed)) return;
+            ElapsedSeconds += elapsed;
+            elapsed = Math.Min(elapsed, simulationLimit);
             // Fixed-size slices make collision and lock timing independent of render cadence.
             while (elapsed > 0 && State == Phase.Playing)
             {
@@ -225,10 +239,12 @@ namespace NeonStack
                 if (RowsCleared != null) RowsCleared(cleared.ToArray());
             }
             if (PieceLocked != null) PieceLocked();
+            if (Mode == GameMode.Sprint40 && Lines >= 40) { State = Phase.Completed; return; }
             Spawn();
         }
 
         public void Pause() { if (State == Phase.Playing) State = Phase.Paused; }
         public void Resume() { if (State == Phase.Paused) State = Phase.Playing; }
+        public void EndRun() { if (State == Phase.Playing || State == Phase.Paused) State = Phase.GameOver; }
     }
 }

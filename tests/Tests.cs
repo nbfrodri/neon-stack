@@ -23,6 +23,11 @@ internal static class Tests
     }
     private static void Land(Game g) { while (g.SoftDrop()) { } }
     private static string Occupied(Game g) { return string.Join(";", Game.Cells(g.Kind, g.Rotation).Select(c => (c.X + g.X) + "," + (c.Y + g.Y)).OrderBy(s => s)); }
+    private static void FinishSetup(Game g, int lines, int clearing)
+    {
+        Array.Clear(g.Board, 0, g.Board.Length); Set(g, "Kind", 0); Set(g, "Rotation", 1); Set(g, "X", 3); Set(g, "Y", -1); Set(g, "Lines", lines);
+        for (int y = 20 - clearing; y < 20; y++) for (int x = 0; x < 10; x++) if (x != 5) g.Board[y, x] = 2;
+    }
     private static void Set(Game g, string property, object value)
     { typeof(Game).GetProperty(property).GetSetMethod(true).Invoke(g, new[] { value }); }
     private static string Temp() { return Path.Combine(Path.GetTempPath(), "NeonStack-tests-" + Guid.NewGuid().ToString("N")); }
@@ -181,6 +186,168 @@ internal static class Tests
             foreach (string mode in new[] { "compact-ready", "compact", "compact-paused", "compact-gameover", "compact-volume" })
                 using (GameForm f = new GameForm(new ScoreStore(Temp()))) { f.PreparePreview(mode); Paint(f, 306, 684); Paint(f, 224, 401); }
         });
+        Check("volume panel pauses gameplay and Escape closes it", delegate {
+            using (GameForm f = new GameForm(new ScoreStore(Temp()))) {
+                Key(f, Keys.Enter, true); ClickButton(f, "volume", 1100, 820);
+                Assert(Engine(f).State == Phase.Paused, "game continues behind volume panel");
+                int pieces = Engine(f).Pieces; Key(f, Keys.Space, true); Assert(Engine(f).Pieces == pieces, "drop leaked through volume panel");
+                Key(f, Keys.Escape, true); Assert(Engine(f).State == Phase.Playing, "closing volume did not restore play");
+                ClickButton(f, "pause", 1100, 820); ClickButton(f, "volume", 1100, 820); Key(f, Keys.Escape, true);
+                Assert(Engine(f).State == Phase.Paused, "closing volume lost manual pause");
+            }
+        });
+        Check("missing primary score file recovers existing backup", delegate { Storage(delegate(string d) {
+            ScoreStore s = new ScoreStore(d); s.Add(100, 1, 0); s.Add(200, 1, 0); File.Delete(s.FilePath);
+            ScoreStore recovered = new ScoreStore(d); Assert(recovered.Best == 100, "backup ignored when primary missing");
+            Assert(recovered.Save() && new ScoreStore(d).Best == 100, "recovered score not persisted");
+        }); });
+        Check("Tab opens records while editing initials without discarding name", delegate { Storage(delegate(string d) {
+            using (GameForm f = new GameForm(new ScoreStore(d))) {
+                Key(f, Keys.Enter, true); for (int i = 0; i < 40 && Engine(f).State == Phase.Playing; i++) Key(f, Keys.Space, true);
+                Key(f, Keys.R, true); Key(f, Keys.Tab, true);
+                Assert((bool)typeof(GameForm).GetField("records", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(f), "Tab swallowed by initials editor");
+                Key(f, Keys.Escape, true); Key(f, Keys.E, true); Key(f, Keys.X, true); Key(f, Keys.Enter, true);
+                Assert(new ScoreStore(d).Data.Entries[0].Initials == "REX", "initials lost across records");
+            }
+        }); });
+        Check("failed save on close preserves data until explicit discard", delegate { Storage(delegate(string d) {
+            Directory.CreateDirectory(d); string blocked = Path.Combine(d, "blocked"); File.WriteAllText(blocked, "file");
+            ScoreStore store = new ScoreStore(blocked); store.Add(321, 1, 0);
+            using (GameForm f = new GameForm(store)) {
+                f.ConfirmCloseWithoutSaving = delegate { return false; };
+                FormClosingEventArgs e = new FormClosingEventArgs(CloseReason.UserClosing, false);
+                typeof(Form).GetMethod("OnFormClosing", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(f, new object[] { e });
+                Assert(e.Cancel && store.Best == 321, "closed without saving or approval");
+                f.ConfirmCloseWithoutSaving = delegate { return true; };
+                e = new FormClosingEventArgs(CloseReason.UserClosing, false);
+                typeof(Form).GetMethod("OnFormClosing", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(f, new object[] { e });
+                Assert(!e.Cancel, "explicit discard cannot close");
+            }
+        }); });
+        Check("sprint finishes exactly at forty and freezes time and controls", delegate {
+            Game g = Fresh(0); g.Pause(); g.Resume(); Set(g, "State", Phase.Ready); g.SelectMode(GameMode.Sprint40); g.Start();
+            g.Tick(12.345, .01); FinishSetup(g, 39, 1); g.HardDrop();
+            Assert(g.State == Phase.Completed && g.RemainingLines == 0 && g.Lines == 40, "sprint did not finish");
+            double time = g.ElapsedSeconds; int score = g.Score; g.Tick(10); g.Move(1); g.HardDrop();
+            Assert(g.ElapsedSeconds == time && g.Score == score, "completed game advanced");
+        });
+        Check("sprint accepts final multiline clear past forty", delegate {
+            Game g = new Game(7); g.SelectMode(GameMode.Sprint40); g.Start(); FinishSetup(g, 39, 4); g.HardDrop();
+            Assert(g.State == Phase.Completed && g.Lines == 43 && g.RemainingLines == 0, "overshoot not completed");
+        });
+        Check("classic continues beyond forty and sprint mode cannot change midgame", delegate {
+            Game g = Fresh(0); g.SelectMode(GameMode.Sprint40); Assert(g.Mode == GameMode.Classic, "changed midgame");
+            FinishSetup(g, 39, 1); g.HardDrop(); Assert(g.State == Phase.Playing && g.Lines == 40, "classic stopped at forty");
+        });
+        Check("sprint timer excludes pause and includes stalls despite physics cap", delegate {
+            Game g = new Game(); g.SelectMode(GameMode.Sprint40); g.Start(); g.Tick(1.25, .01); g.Pause(); g.Tick(50); g.Resume(); g.Tick(2.5, .01);
+            Assert(Math.Abs(g.ElapsedSeconds - 3.75) < .0001, "clock used capped simulation time or pause");
+            g.Start(); Assert(g.ElapsedSeconds == 0 && g.Mode == GameMode.Sprint40, "restart lost mode or time");
+        });
+        Check("sprint rankings use ascending time and stay separate from classic", delegate { Storage(delegate(string d) {
+            ScoreStore s = new ScoreStore(d); s.Add(999999, 5, 40);
+            for (int i = 25; i >= 1; i--) s.AddSprint(i * 1000, 100, 5, 40);
+            ScoreStore loaded = new ScoreStore(d); Assert(loaded.Data.SprintEntries.Count == 20 && loaded.Data.SprintEntries[0].Milliseconds == 1000 && loaded.Data.SprintEntries[19].Milliseconds == 20000, "sprint sorting/limit");
+            Assert(loaded.Data.Entries.Count == 1 && loaded.Best == 999999, "classic ranking changed");
+            bool rejected = false; try { s.AddSprint(1000, 1, 1, 39); } catch (ArgumentException) { rejected = true; } Assert(rejected, "unfinished sprint ranked");
+        }); });
+        Check("sprint UI stores completion once and accepts initials", delegate { Storage(delegate(string d) {
+            using (GameForm f = new GameForm(new ScoreStore(d))) {
+                Key(f, Keys.F5, true); Key(f, Keys.Enter, true); Game g = Engine(f); g.Tick(65.432, .01); FinishSetup(g, 39, 1); Key(f, Keys.Space, true);
+                Assert(g.State == Phase.Completed, "UI completion"); Key(f, Keys.M, true); Key(f, Keys.A, true); Key(f, Keys.X, true); Key(f, Keys.Enter, true);
+                ScoreStore loaded = new ScoreStore(d); Assert(loaded.Data.SprintEntries.Count == 1 && loaded.Data.SprintEntries[0].Initials == "MAX" && loaded.Data.Entries.Count == 0, "sprint save or M initials");
+                using (Bitmap b = new Bitmap(1100, 820)) using (Graphics graphics = Graphics.FromImage(b)) { f.Render(graphics, 1100, 820); b.Save(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sprint-completed.png")); }
+                Key(f, Keys.Enter, true); Assert(g.State == Phase.Playing && g.ElapsedSeconds == 0, "sprint restart");
+            }
+        }); });
+        Check("unfinished sprint never enters either ranking", delegate { Storage(delegate(string d) {
+            using (GameForm f = new GameForm(new ScoreStore(d))) { Key(f, Keys.F5, true); Key(f, Keys.Enter, true); for (int i = 0; i < 40 && Engine(f).State == Phase.Playing; i++) Key(f, Keys.Space, true);
+                Assert(Engine(f).State == Phase.GameOver, "did not lose"); ScoreStore loaded = new ScoreStore(d); Assert(loaded.Data.SprintEntries.Count == 0 && loaded.Data.Entries.Count == 0, "failed run ranked"); Key(f, Keys.Enter, true); Assert(Engine(f).State == Phase.Playing, "retry failed"); }
+        }); });
+        Check("window fitting recovers disconnected monitor and small desktops", delegate {
+            Rectangle area = new Rectangle(0, 0, 1280, 680); Rectangle bounds = WindowPlacement.Fit(new Rectangle(-2000, 50, 1116, 859), area, new Size(900, 720));
+            Assert(area.Contains(bounds) && bounds.Width == 1116 && bounds.Height == 680, "offscreen window");
+            area = new Rectangle(-1920, -200, 1920, 1040); bounds = WindowPlacement.Fit(new Rectangle(-1800, 0, 320, 700), area, new Size(240, 440)); Assert(bounds.X == -1800 && bounds.Y == 0, "valid secondary position lost");
+        });
+        Check("window sizes and positions persist independently across restart", delegate { Storage(delegate(string d) {
+            Rectangle full, mini;
+            using (GameForm f = new GameForm(new ScoreStore(d))) {
+                full = f.Bounds; f.SetCompact(true); f.Size = new Size(280, 590);
+                Rectangle area = Screen.FromControl(f).WorkingArea; f.Location = new Point(area.X + 23, area.Y + 25); mini = f.Bounds;
+                f.SetCompact(false); Assert(f.Bounds == full, "full placement not restored"); f.SetCompact(true); Assert(f.Bounds == mini, "compact placement not restored");
+                typeof(Form).GetMethod("OnFormClosing", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(f, new object[] { new FormClosingEventArgs(CloseReason.UserClosing, false) });
+            }
+            using (GameForm f = new GameForm(new ScoreStore(d))) { Assert(f.Compact && f.Bounds == mini, "placement lost on restart"); f.SetCompact(false); Assert(f.Bounds == full, "full placement lost on restart"); }
+        }); });
+        Check("M toggles mute once and works in volume panel", delegate {
+            using (GameForm f = new GameForm(new ScoreStore(Temp()))) { Key(f, Keys.M, false); Key(f, Keys.M, true); Assert(Sound(f).Muted, "repeat toggled mute twice"); Key(f, Keys.M, true); Assert(!Sound(f).Muted, "unmute"); ClickButton(f, "volume", 1100, 820); Key(f, Keys.M, true); Assert(Sound(f).Muted, "M ignored in volume"); }
+        });
+        Check("mixer sums simultaneous voices without interrupting melody", delegate {
+            AudioMixer mixed = new AudioMixer(), clear = new AudioMixer(), rotate = new AudioMixer();
+            mixed.Play(Effect.Clear); mixed.Play(Effect.Rotate); clear.Play(Effect.Clear); rotate.Play(Effect.Rotate);
+            short[] a = new short[800], b = new short[800], c = new short[800]; mixed.Render(a); clear.Render(b); rotate.Render(c);
+            for (int i = 0; i < a.Length; i++) Assert(Math.Abs(a[i] - b[i] - c[i]) <= 2, "voices not mixed");
+            mixed.Render(new short[1000]); Assert(mixed.HasVoice(Effect.Clear) && !mixed.HasVoice(Effect.Rotate), "melody interrupted by short effect");
+        });
+        Check("priority rejects low sounds when all voices are melodies", delegate {
+            AudioMixer mixer = new AudioMixer(); for (int i = 0; i < 8; i++) mixer.Play(Effect.Tetris); mixer.Play(Effect.Rotate);
+            Assert(mixer.VoiceCount == 8 && !mixer.HasVoice(Effect.Rotate), "rotation evicted melody");
+            mixer.Muted = true; short[] samples = new short[256]; mixer.Render(samples); Assert(samples.All(s => s == 0) && mixer.VoiceCount == 0, "mute leaked audio");
+        });
+        Check("sprint screens render in full and compact layouts", delegate {
+            foreach (string mode in new[] { "sprint-ready", "sprint", "sprint-records-filled", "compact-sprint-ready", "compact-sprint" })
+                using (GameForm f = new GameForm(new ScoreStore(Temp()))) { f.PreparePreview(mode); Paint(f, f.Compact ? 306 : 1100, f.Compact ? 684 : 820); }
+        });
+        Check("ending paused classic saves result and X dismisses without closing app", delegate { Storage(delegate(string d) {
+            using (GameForm f = new GameForm(new ScoreStore(d))) {
+                Key(f, Keys.Enter, true); Key(f, Keys.S, true); Key(f, Keys.Escape, true);
+                ClickButton(f, "end-run", 1100, 820); Assert(Engine(f).State == Phase.GameOver && new ScoreStore(d).Data.Entries.Count == 1, "end did not save classic");
+                Key(f, Keys.M, true); Key(f, Keys.A, true); Key(f, Keys.X, true); Key(f, Keys.Enter, true); Key(f, Keys.X, true);
+                Assert(!f.IsDisposed && Engine(f).State == Phase.GameOver && (bool)typeof(GameForm).GetField("resultsDismissed", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(f), "X closed app or kept results open");
+                Assert(new ScoreStore(d).Data.Entries[0].Initials == "MAX", "initials lost"); ClickButton(f, "start", 1100, 820); Assert(Engine(f).State == Phase.Playing, "cannot start after dismiss");
+            }
+        }); });
+        Check("ending compact sprint leaves no completed time", delegate { Storage(delegate(string d) {
+            using (GameForm f = new GameForm(new ScoreStore(d))) {
+                Key(f, Keys.F5, true); f.SetCompact(true); Key(f, Keys.Enter, true); Key(f, Keys.Escape, true); ClickButton(f, "end-run", 306, 684);
+                Assert(Engine(f).State == Phase.GameOver && new ScoreStore(d).Data.SprintEntries.Count == 0, "aborted sprint ranked");
+                ClickButton(f, "exit", 306, 684); Assert(!f.IsDisposed && (bool)typeof(GameForm).GetField("resultsDismissed", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(f), "exit did not dismiss"); ClickButton(f, "start", 306, 684); Assert(Engine(f).State == Phase.Playing, "compact restart");
+            }
+        }); });
+        Check("help pauses play blocks gameplay and restores prior pause state", delegate {
+            using (GameForm f = new GameForm(new ScoreStore(Temp()))) {
+                Key(f, Keys.Enter, true); Key(f, Keys.F1, true); Assert(Engine(f).State == Phase.Paused, "help did not pause");
+                int pieces = Engine(f).Pieces; Key(f, Keys.Space, true); Assert(Engine(f).Pieces == pieces, "help leaked gameplay");
+                Key(f, Keys.Escape, true); Assert(Engine(f).State == Phase.Playing, "help did not resume");
+                Key(f, Keys.Escape, true); Key(f, Keys.F1, true); Key(f, Keys.F1, true); Assert(Engine(f).State == Phase.Paused, "help lost manual pause");
+            }
+        });
+        Check("help buttons work in both layouts", delegate {
+            foreach (bool compact in new[] { false, true }) using (GameForm f = new GameForm(new ScoreStore(Temp()))) {
+                f.SetCompact(compact); int w = compact ? 306 : 1100, h = compact ? 684 : 820;
+                ClickButton(f, "help", w, h); Paint(f, w, h); ClickButton(f, "help-close", w, h); ClickButton(f, "start", w, h);
+                Assert(Engine(f).State == Phase.Playing, "help hid start after close");
+            }
+        });
+        Check("ghost toggle changes rendering without changing game in both layouts", delegate {
+            foreach (bool compact in new[] { false, true }) using (GameForm f = new GameForm(new ScoreStore(Temp()))) {
+                f.SetCompact(compact); Key(f, Keys.Enter, true); Game g = Engine(f);
+                int w = compact ? 306 : 1100, h = compact ? 684 : 820, target = g.GhostY;
+                string piece = Occupied(g); ClickButton(f, "ghost", w, h);
+                Assert(!(bool)typeof(GameForm).GetProperty("ShowGhost", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(f, null), "ghost still enabled");
+                Assert(Occupied(g) == piece && g.GhostY == target && g.State == Phase.Playing, "toggle changed gameplay");
+                ClickButton(f, "ghost", w, h); Assert((bool)typeof(GameForm).GetProperty("ShowGhost", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(f, null), "toggle did not restore ghost");
+            }
+        });
+        Check("ghost preference defaults on and persists off across restart", delegate { Storage(delegate(string d) {
+            ScoreStore store = new ScoreStore(d);
+            using (GameForm f = new GameForm(store)) {
+                Assert((bool)typeof(GameForm).GetProperty("ShowGhost", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(f, null), "default ghost off");
+                ClickButton(f, "ghost", 1100, 820);
+                typeof(Form).GetMethod("OnFormClosing", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(f, new object[] { new FormClosingEventArgs(CloseReason.UserClosing, false) });
+            }
+            using (GameForm f = new GameForm(new ScoreStore(d))) Assert(!(bool)typeof(GameForm).GetProperty("ShowGhost", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(f, null), "ghost preference lost");
+        }); });
         Console.WriteLine("\n" + passed + " passed, " + failed + " failed.");
         return failed == 0 ? 0 : 1;
     }

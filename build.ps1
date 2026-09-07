@@ -1,3 +1,4 @@
+param([ValidatePattern('^[A-Za-z0-9._-]+\.exe$')][string]$ExecutableName = 'NeonStack.exe')
 $ErrorActionPreference = 'Stop'
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
 if (-not (Test-Path -LiteralPath $compiler)) {
@@ -14,6 +15,6 @@ if ($LASTEXITCODE -ne 0) { throw 'No se pudo compilar el generador de iconos.' }
 & "$artifacts/IconBuilder.exe" "$PSScriptRoot/assets/neon-stack.ico" "$artifacts/icon.png"
 if ($LASTEXITCODE -ne 0) { throw 'No se pudo generar el icono.' }
 $sources = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'src') -Filter '*.cs' | ForEach-Object { $_.FullName }
-& $compiler /nologo /target:winexe /platform:anycpu /optimize+ /warnaserror+ /codepage:65001 "/out:$output/NeonStack.exe" "/win32manifest:$PSScriptRoot/app.manifest" "/win32icon:$PSScriptRoot/assets/neon-stack.ico" /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Runtime.Serialization.dll /reference:System.Xml.dll $sources
+& $compiler /nologo /target:winexe /platform:anycpu /optimize+ /warnaserror+ /codepage:65001 "/out:$output/$ExecutableName" "/win32manifest:$PSScriptRoot/app.manifest" "/win32icon:$PSScriptRoot/assets/neon-stack.ico" /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Runtime.Serialization.dll /reference:System.Xml.dll $sources
 if ($LASTEXITCODE -ne 0) { throw 'La compilacion ha fallado.' }
-Write-Output "Compilado: $output/NeonStack.exe"
+Write-Output "Compilado: $output/$ExecutableName"

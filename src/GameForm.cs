@@ -40,10 +40,16 @@ namespace NeonStack
         private bool records, resumeAfterRecords, editingInitials, replaceInitials;
         private ScoreEntry latest;
         private float scale = 1, offsetX, offsetY;
-        private bool compact, volumeOpen, draggingVolume;
-        private Rectangle fullBounds;
+        private bool compact, volumeOpen, draggingVolume, resumeAfterVolume;
+        private bool terminalHandled, resultsDismissed;
+        private bool ShowGhost { get { return scores.Data.ShowGhost ?? true; } }
+        private bool helpOpen, resumeAfterHelp;
+        private bool Sprint { get { return game.Mode == GameMode.Sprint40; } }
+        private List<ScoreEntry> Ranking { get { return Sprint ? scores.Data.SprintEntries : scores.Data.Entries; } }
+        private string RunTime { get { return ScoreStore.FormatTime((long)(game.ElapsedSeconds * 1000)); } }
         private RectangleF volumeSlider;
         internal bool Compact { get { return compact; } }
+        internal Func<bool> ConfirmCloseWithoutSaving;
 
         public GameForm(ScoreStore store, bool enableAudio = false)
         {
@@ -61,11 +67,25 @@ namespace NeonStack
             game.RowsCleared += delegate(int[] rows) { flashedRows = rows; lastClear = rows.Length; lastClearPoints = new[] { 0, 100, 300, 500, 800 }[rows.Length] * ((game.Lines - rows.Length) / 10 + 1); flashTime = 0.42; audio.Play(rows.Length == 4 ? Effect.Tetris : Effect.Clear); };
             game.PieceLocked += delegate { lockPulse = 0.12; if (flashTime <= 0) audio.Play(Effect.Lock); };
             timer.Tick += delegate { Advance(); };
-            Deactivate += delegate { game.Pause(); audio.Stop(); ClearInput(); pressed.Clear(); Invalidate(); };
-            FormClosing += delegate { CapturePreferences(); if (editingInitials && latest != null) scores.Rename(latest, initials); else scores.Save(); };
+            Deactivate += delegate { Advance(); game.Pause(); audio.Stop(); ClearInput(); pressed.Clear(); Invalidate(); };
+            ConfirmCloseWithoutSaving = delegate { return MessageBox.Show(this,
+                "No se han podido guardar los récords o preferencias. ¿Quieres cerrar y descartar los cambios sin guardar?",
+                "NEON STACK — Error al guardar", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes; };
+            FormClosing += delegate(object sender, FormClosingEventArgs e)
+            {
+                CapturePreferences();
+                bool saved = editingInitials && latest != null ? scores.Rename(latest, initials) : scores.Save();
+                if (!saved && e.CloseReason == CloseReason.UserClosing)
+                {
+                    game.Pause(); audio.Stop(); ClearInput();
+                    e.Cancel = !ConfirmCloseWithoutSaving(); Invalidate();
+                }
+            };
             Shown += delegate { previous = clock.Elapsed.TotalSeconds; timer.Start(); };
             TopMost = store.Data.OnTop;
-            if (store.Data.Compact) SetCompact(true);
+            game.SelectMode(store.Data.Sprint ? GameMode.Sprint40 : GameMode.Classic);
+            compact = store.Data.Compact;
+            RestoreWindow();
         }
 
         protected override void Dispose(bool disposing)
@@ -78,7 +98,7 @@ namespace NeonStack
 
         private void Advance()
         {
-            double now = clock.Elapsed.TotalSeconds, dt = Math.Min(0.10, now - previous); previous = now;
+            double now = clock.Elapsed.TotalSeconds, elapsed = Math.Max(0, now - previous), dt = Math.Min(0.10, elapsed); previous = now;
             if (game.State == Phase.Playing && !records)
             {
                 if (direction != 0)
@@ -91,7 +111,7 @@ namespace NeonStack
                     dropTime -= dt;
                     while (dropTime <= 0) { game.SoftDrop(); dropTime += 0.035; }
                 }
-                game.Tick(dt);
+                game.Tick(elapsed, .10);
                 ObserveGameOver();
                 flashTime = Math.Max(0, flashTime - dt); lockPulse = Math.Max(0, lockPulse - dt);
             }
@@ -109,16 +129,19 @@ namespace NeonStack
 
         private void ObserveGameOver()
         {
-            if (game.State != Phase.GameOver || latest != null) return;
-            latest = scores.Add(game.Score, game.Level, game.Lines);
-            audio.Play(Effect.Over);
-            initials = scores.Data.LastInitials; editingInitials = true; replaceInitials = true; ClearInput();
+            if ((game.State != Phase.GameOver && game.State != Phase.Completed) || terminalHandled) return;
+            terminalHandled = true;
+            if (Sprint)
+                latest = game.State == Phase.Completed ? scores.AddSprint(Math.Max(1, (long)(game.ElapsedSeconds * 1000)), game.Score, game.Level, game.Lines) : null;
+            else latest = scores.Add(game.Score, game.Level, game.Lines);
+            audio.Play(game.State == Phase.Completed ? Effect.Tetris : Effect.Over);
+            initials = scores.Data.LastInitials; editingInitials = latest != null; replaceInitials = true; ClearInput();
             Invalidate();
         }
 
         private void StartGame()
         {
-            latest = null; editingInitials = false; records = false; flashTime = lockPulse = 0;
+            latest = null; terminalHandled = false; resultsDismissed = false; editingInitials = false; records = false; flashTime = lockPulse = 0;
             ClearInput(); game.Start(); timer.Interval = 8; previous = clock.Elapsed.TotalSeconds; Invalidate();
             audio.Play(Effect.Start);
         }
@@ -130,6 +153,16 @@ namespace NeonStack
             if (saved) { editingInitials = false; toast = "PUNTUACION GUARDADA"; toastTime = 3; }
             else { toast = "ERROR AL GUARDAR. ENTER PARA REINTENTAR"; toastTime = 5; }
             Invalidate();
+        }
+
+        private void DismissResults()
+        {
+            if (game.State != Phase.GameOver && game.State != Phase.Completed) return;
+            if (editingInitials && latest != null && !scores.Rename(latest, initials))
+            {
+                toast = "ERROR AL GUARDAR. ENTER PARA REINTENTAR"; toastTime = 5; Invalidate(); return;
+            }
+            editingInitials = false; resultsDismissed = true; ClearInput(); Invalidate();
         }
 
         private void TogglePause()
@@ -160,11 +193,23 @@ namespace NeonStack
         protected override void OnKeyDown(KeyEventArgs e)
         {
             base.OnKeyDown(e);
+            Advance();
             e.Handled = true; e.SuppressKeyPress = true;
             if (!pressed.Add(e.KeyCode)) return;
             if (e.KeyCode == Keys.F2) { SetCompact(!compact); return; }
             if (e.KeyCode == Keys.F3) { TopMost = !TopMost; Invalidate(); return; }
-            if (e.KeyCode == Keys.F4) { audio.Muted = !audio.Muted; Invalidate(); return; }
+            if (e.KeyCode == Keys.F4 || (e.KeyCode == Keys.M && (!editingInitials || records || volumeOpen || helpOpen))) { audio.Muted = !audio.Muted; Invalidate(); return; }
+            if (e.KeyCode == Keys.F1) { SetHelpOpen(!helpOpen); return; }
+            if (helpOpen) { if (e.KeyCode == Keys.Escape) SetHelpOpen(false); return; }
+            if (e.KeyCode == Keys.F5 && !volumeOpen && !records) { ToggleMode(); return; }
+            if (volumeOpen)
+            {
+                if (e.KeyCode == Keys.Escape || e.KeyCode == Keys.Enter) SetVolumeOpen(false);
+                else if (e.KeyCode == Keys.Left || e.KeyCode == Keys.Down) { audio.Volume -= 5; Invalidate(); }
+                else if (e.KeyCode == Keys.Right || e.KeyCode == Keys.Up) { audio.Volume += 5; Invalidate(); }
+                return;
+            }
+            if (e.KeyCode == Keys.Tab) { ToggleRecords(); return; }
             if (editingInitials && !records)
             {
                 if (e.KeyCode == Keys.Enter) SaveInitials();
@@ -178,8 +223,8 @@ namespace NeonStack
             }
             if (!held.Add(e.KeyCode)) return;
             if (records) { if (e.KeyCode == Keys.Escape || e.KeyCode == Keys.Tab) ToggleRecords(); return; }
-            if (e.KeyCode == Keys.Tab) { ToggleRecords(); return; }
-            if (e.KeyCode == Keys.Enter && (game.State == Phase.Ready || game.State == Phase.GameOver)) { StartGame(); return; }
+            if (e.KeyCode == Keys.X && (game.State == Phase.GameOver || game.State == Phase.Completed)) { DismissResults(); return; }
+            if (e.KeyCode == Keys.Enter && (game.State == Phase.Ready || game.State == Phase.GameOver || game.State == Phase.Completed)) { StartGame(); return; }
             if (e.KeyCode == Keys.Escape || e.KeyCode == Keys.P) { TogglePause(); return; }
             if (game.State != Phase.Playing) return;
             if (e.KeyCode == Keys.Left || e.KeyCode == Keys.A) { direction = -1; lateralTime = 0.16; game.Move(-1); }
@@ -217,6 +262,7 @@ namespace NeonStack
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
+            Advance();
             if (e.Button != MouseButtons.Left) return;
             PointF point = new PointF((e.X - offsetX) / scale, (e.Y - offsetY) / scale);
             if (volumeOpen && volumeSlider.Contains(point)) { draggingVolume = true; Capture = true; SetVolumeFromPoint(point); return; }
@@ -226,12 +272,18 @@ namespace NeonStack
             else if (button == "records" || button == "compact-records" || button == "close-records") ToggleRecords();
             else if (button == "save") SaveInitials();
             else if (button == "mute") audio.Muted = !audio.Muted;
-            else if (button == "volume") volumeOpen = !volumeOpen;
+            else if (button == "volume") SetVolumeOpen(!volumeOpen);
             else if (button == "compact") SetCompact(!compact);
             else if (button == "top") TopMost = !TopMost;
             else if (button == "vol-down") { audio.Volume -= 10; audio.Play(Effect.Rotate); }
             else if (button == "vol-up") { audio.Volume += 10; audio.Play(Effect.Rotate); }
-            else if (button == "vol-close") volumeOpen = false;
+            else if (button == "vol-close") SetVolumeOpen(false);
+            else if (button == "mode") ToggleMode();
+            else if (button == "end-run") { game.EndRun(); ObserveGameOver(); }
+            else if (button == "exit") DismissResults();
+            else if (button == "help") SetHelpOpen(true);
+            else if (button == "help-close") SetHelpOpen(false);
+            else if (button == "ghost") scores.Data.ShowGhost = !ShowGhost;
             Invalidate();
         }
 
@@ -244,23 +296,67 @@ namespace NeonStack
         private void SetVolumeFromPoint(PointF point)
         { audio.Volume = (int)Math.Round(100 * (point.X - volumeSlider.X) / volumeSlider.Width); Invalidate(); }
 
+        private void SetVolumeOpen(bool value)
+        {
+            if (volumeOpen == value) return;
+            if (value) { resumeAfterVolume = game.State == Phase.Playing; game.Pause(); }
+            else
+            {
+                draggingVolume = false; Capture = false;
+                if (resumeAfterVolume) { game.Resume(); timer.Interval = 8; }
+            }
+            volumeOpen = value; ClearInput(); previous = clock.Elapsed.TotalSeconds; Invalidate();
+        }
+
+        private void SetHelpOpen(bool value)
+        {
+            if (helpOpen == value) return;
+            if (value)
+            {
+                SetVolumeOpen(false);
+                if (records) { records = false; if (resumeAfterRecords) game.Resume(); }
+                resumeAfterHelp = game.State == Phase.Playing; game.Pause();
+            }
+            else if (resumeAfterHelp) { game.Resume(); timer.Interval = 8; }
+            helpOpen = value; ClearInput(); previous = clock.Elapsed.TotalSeconds; Invalidate();
+        }
+
         private void CapturePreferences()
-        { scores.Data.Volume = audio.Volume; scores.Data.Muted = audio.Muted; scores.Data.Compact = compact; scores.Data.OnTop = TopMost; }
+        { RememberWindow(); scores.Data.Volume = audio.Volume; scores.Data.Muted = audio.Muted; scores.Data.Compact = compact; scores.Data.OnTop = TopMost; scores.Data.Sprint = Sprint; }
+
+        private void RememberWindow()
+        {
+            Rectangle bounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            if (bounds.Width <= 0 || bounds.Height <= 0) return;
+            if (compact) scores.Data.CompactWindow = WindowPlacement.From(bounds);
+            else scores.Data.FullWindow = WindowPlacement.From(bounds);
+        }
+
+        private void RestoreWindow()
+        {
+            WindowPlacement saved = compact ? scores.Data.CompactWindow : scores.Data.FullWindow;
+            Size preferred = compact ? new Size(322, 723) : new Size(1116, 859);
+            Rectangle requested = saved != null && saved.Width > 0 && saved.Height > 0 ? saved.Bounds : new Rectangle(Location, preferred);
+            Rectangle area = Screen.FromRectangle(requested).WorkingArea;
+            if (saved == null) requested.Location = new Point(area.Left + (area.Width - preferred.Width) / 2, area.Top + (area.Height - preferred.Height) / 2);
+            Size minimum = compact ? new Size(240, 440) : new Size(900, 720);
+            WindowState = FormWindowState.Normal;
+            MinimumSize = new Size(Math.Min(minimum.Width, area.Width), Math.Min(minimum.Height, area.Height));
+            StartPosition = FormStartPosition.Manual; Bounds = WindowPlacement.Fit(requested, area, minimum);
+        }
+
+        private void ToggleMode()
+        {
+            if (editingInitials || game.State == Phase.Playing || game.State == Phase.Paused) return;
+            game.SelectMode(Sprint ? GameMode.Classic : GameMode.Sprint40);
+            latest = null; terminalHandled = false; resultsDismissed = false; ClearInput(); Invalidate();
+        }
 
         internal void SetCompact(bool value)
         {
             if (compact == value) return;
-            volumeOpen = false; records = false; hover = null;
-            if (value)
-            {
-                fullBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
-                WindowState = FormWindowState.Normal; compact = true;
-                MinimumSize = new Size(240, 440); ClientSize = new Size(306, 684);
-            }
-            else { compact = false; MinimumSize = new Size(900, 720); Bounds = fullBounds; }
-            Rectangle area = Screen.FromControl(this).WorkingArea;
-            if (Height > area.Height) Height = Math.Max(MinimumSize.Height, area.Height);
-            Location = new Point(Math.Max(area.Left, Math.Min(Left, area.Right - Width)), Math.Max(area.Top, Math.Min(Top, area.Bottom - Height)));
+            SetVolumeOpen(false); records = false; hover = null;
+            RememberWindow(); compact = value; RestoreWindow();
             ClearInput(); Invalidate();
         }
 
@@ -270,17 +366,17 @@ namespace NeonStack
             using (Form dialog = new Form())
             using (ListView list = new ListView())
             {
-                dialog.Text = "NEON STACK — Clasificación"; dialog.ClientSize = new Size(580, 430);
+                dialog.Text = Sprint ? "NEON STACK — Sprint 40 / Tiempos" : "NEON STACK — Clasificación"; dialog.ClientSize = new Size(580, 430);
                 dialog.StartPosition = FormStartPosition.CenterParent; dialog.BackColor = Background; dialog.KeyPreview = true;
                 dialog.MinimizeBox = false; dialog.MaximizeBox = false; dialog.ShowInTaskbar = false;
                 list.Dock = DockStyle.Fill; list.View = View.Details; list.FullRowSelect = true;
                 list.BackColor = Background; list.ForeColor = Ink;
-                list.Columns.Add("#", 35); list.Columns.Add("Nombre", 70); list.Columns.Add("Puntos", 95);
+                list.Columns.Add("#", 35); list.Columns.Add("Nombre", 70); list.Columns.Add(Sprint ? "Tiempo" : "Puntos", 95);
                 list.Columns.Add("Nivel", 55); list.Columns.Add("Líneas", 60); list.Columns.Add("Fecha", 165);
-                for (int i = 0; i < scores.Data.Entries.Count; i++)
+                for (int i = 0; i < Ranking.Count; i++)
                 {
-                    ScoreEntry entry = scores.Data.Entries[i];
-                    list.Items.Add(new ListViewItem(new[] { (i + 1).ToString(), entry.Initials, entry.Score.ToString(), entry.Level.ToString(), entry.Lines.ToString(), entry.Date.ToString("dd/MM/yyyy HH:mm") }));
+                    ScoreEntry entry = Ranking[i];
+                    list.Items.Add(new ListViewItem(new[] { (i + 1).ToString(), entry.Initials, Sprint ? ScoreStore.FormatTime(entry.Milliseconds.Value) : entry.Score.ToString(), entry.Level.ToString(), entry.Lines.ToString(), entry.Date.ToString("dd/MM/yyyy HH:mm") }));
                 }
                 dialog.Controls.Add(list); dialog.KeyDown += delegate(object sender, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) dialog.Close(); };
                 dialog.ShowDialog(this);
@@ -305,20 +401,49 @@ namespace NeonStack
             else
             {
                 DrawChrome(g); DrawStats(g); DrawBoard(g); DrawNext(g); DrawControls(g);
-                if (game.State != Phase.Playing) DrawOverlay(g);
+                if (game.State != Phase.Playing && !resultsDismissed) DrawOverlay(g);
                 if (records) { buttons.Clear(); DrawRecords(g); }
-                else DrawToolbar(g, 392, 43, 78);
+                else { DrawToolbar(g, 392, 43, 78); DrawMode(g, 392, 78, 328, 22); Button(g, "help", "F1 AYUDA", 748, 43, 104, 27, false, 1); DrawGhostButton(g, 732, 78, 22); }
             }
             if (volumeOpen) DrawVolume(g);
+            if (helpOpen) DrawHelp(g);
             g.Restore(saved);
         }
 
         private void DrawToolbar(Graphics g, int x, int y, int width)
         {
-            Button(g, "mute", audio.Muted ? "MUDO" : "SONIDO", x, y, width, 27, false, 1);
+            Button(g, "mute", "", x, y, width, 27, false, 1);
+            DrawSpeaker(g, x + width / 2 - 15, y + 5);
+            Label(g, "M", x + width - 13, y + 8, 10, Muted);
             Button(g, "volume", "VOL " + audio.Volume, x + width + 5, y, width, 27, false, 1);
             Button(g, "compact", compact ? "AMPLIAR" : "MINI", x + (width + 5) * 2, y, width, 27, false, 1);
             Button(g, "top", TopMost ? "FIJADO" : "ENCIMA", x + (width + 5) * 3, y, width, 27, false, 1);
+        }
+
+        private void DrawSpeaker(Graphics g, int x, int y)
+        {
+            Color color = audio.Muted || audio.Volume == 0 ? Muted : Ink;
+            using (SolidBrush brush = new SolidBrush(color))
+            using (Pen pen = new Pen(color, 1.6f))
+            {
+                g.FillRectangle(brush, x, y + 5, 5, 7);
+                g.FillPolygon(brush, new[] { new Point(x + 4,y + 5), new Point(x + 11,y), new Point(x + 11,y + 17), new Point(x + 4,y + 12) });
+                if (audio.Muted || audio.Volume == 0) { g.DrawLine(pen, x + 16, y + 5, x + 24, y + 13); g.DrawLine(pen, x + 24, y + 5, x + 16, y + 13); }
+                else { g.DrawArc(pen, x + 9, y + 3, 12, 12, -55, 110); g.DrawArc(pen, x + 7, y, 19, 18, -55, 110); }
+            }
+        }
+
+        private void DrawGhostButton(Graphics g, int x, int y, int height)
+        {
+            Button(g, "ghost", ShowGhost ? "FANTASMA ON" : "FANTASMA OFF", x, y, 104, height, false, 1);
+        }
+
+        private void DrawMode(Graphics g, int x, int y, int width, int height)
+        {
+            string name = Sprint ? "SPRINT 40" : "CLASICO";
+            if (!editingInitials && game.State != Phase.Playing && game.State != Phase.Paused)
+                Button(g, "mode", "MODO: " + name + " / F5 >", x, y, width, height, false, 1);
+            else Label(g, Sprint ? "SPRINT 40 / TIEMPO ACTIVO" : "CLÁSICO / PUNTUACIÓN", x + 4, y + 4, 11, Muted);
         }
 
         private void ImmediateNext(Graphics g, int x, int y, int tile)
@@ -333,18 +458,20 @@ namespace NeonStack
             // Reuse the actual board/overlays at native logical tile size. Hit targets
             // are translated too, so buttons retain their behavior when scaled down.
             GraphicsState saved = g.Save(); g.TranslateTransform(20 - BoardX, 116 - BoardY);
-            DrawBoard(g); if (game.State != Phase.Playing) DrawOverlay(g);
+            DrawBoard(g); if (game.State != Phase.Playing && !resultsDismissed) DrawOverlay(g);
             g.Restore(saved);
             foreach (string key in buttons.Keys.ToArray())
             { RectangleF rect = buttons[key]; rect.Offset(20 - BoardX, 116 - BoardY); buttons[key] = rect; }
-            Pixel(g, game.Score.ToString("D6"), 20, 13, 3, Lime);
-            Label(g, "NV " + game.Level.ToString("D2") + " / " + game.Lines + " LÍNEAS", 179, 19, 12, Ink);
+            Pixel(g, Sprint ? RunTime : game.Score.ToString("D6"), 20, 13, Sprint ? 2 : 3, Lime);
+            Label(g, Sprint ? game.RemainingLines + " POR LIMPIAR" : "NV " + game.Level.ToString("D2") + " / " + game.Lines + " LÍNEAS", 179, 19, 12, Ink);
             DrawToolbar(g, 20, 47, 71);
-            Button(g, game.State == Phase.Playing || game.State == Phase.Paused ? "pause" : "records", game.State == Phase.Playing ? "PAUSA" : game.State == Phase.Paused ? "SEGUIR" : "RECORDS", 20, 83, 73, 24, false, 1);
+            Button(g, game.State == Phase.Playing || game.State == Phase.Paused ? "pause" : resultsDismissed ? "start" : "records", game.State == Phase.Playing ? "PAUSA" : game.State == Phase.Paused ? "SEGUIR" : resultsDismissed ? "JUGAR" : "RECORDS", 20, 83, 73, 24, false, 1);
             Button(g, "compact-records", "TOP 20", 100, 83, 63, 24, false, 1);
+            Button(g, "help", "?", 170, 83, 25, 24, false, 1);
             Label(g, "SIG.", 199, 89, 11, Muted); ImmediateNext(g, 247, 83, 14);
-            Label(g, "F2 ampliar · F3 encima · F4 silencio", 20, 741, 11, Muted);
-            if (scores.Notice != null) Label(g, "! Récords sin guardar", 20, 725, 11, Colors[4]);
+            DrawMode(g, 20, 733, 190, 20);
+            DrawGhostButton(g, 216, 733, 20);
+            if (scores.Notice != null) Label(g, "! Revisar guardado de récords", 20, 717, 11, Colors[4]);
         }
 
         private void DrawVolume(Graphics g)
@@ -360,7 +487,49 @@ namespace NeonStack
             Fill(g, Border, x + 57, y + 60, 185, 5);
             Fill(g, Lime, x + 57, y + 60, 185 * audio.Volume / 100f, 5);
             Fill(g, Ink, x + 54 + 185 * audio.Volume / 100f, y + 53, 6, 19);
-            Label(g, "Arrastra la barra · Solo este juego", x + 14, y + 88, 11, Muted);
+            Label(g, "Arrastra / flechas · ESC para cerrar", x + 14, y + 88, 11, Muted);
+        }
+
+        private void DrawHelp(Graphics g)
+        {
+            buttons.Clear();
+            Fill(g, Color.FromArgb(245, Background), 0, 0, compact ? 340 : CanvasWidth, compact ? 760 : CanvasHeight);
+            int x = compact ? 12 : 240, y = compact ? 70 : 125, width = compact ? 316 : 620;
+            Panel(g, x, y, width, 625);
+            Pixel(g, "AYUDA", x + 18, y + 20, 3, Lime);
+            Button(g, "help-close", "X", x + width - 42, y + 15, 25, 27, false, 1);
+            Label(g, "CONTROLES Y ATAJOS", x + 18, y + 58, compact ? 11 : 13, Muted);
+            string[][] rows = {
+                new[] { "Mover izquierda / derecha", "A/D · ←/→" },
+                new[] { "Girar a la derecha", "W / ↑" },
+                new[] { "Girar a la izquierda", "Z" },
+                new[] { "Bajar más rápido", "S / ↓" },
+                new[] { "Caer y fijar", "Espacio" },
+                new[] { "Pausar / continuar", "Esc / P" },
+                new[] { "Empezar / repetir", "Enter" },
+                new[] { "Clásico / Sprint 40", "F5 (antes)" },
+                new[] { "Compacto / completo", "F2" },
+                new[] { "Siempre encima", "F3" },
+                new[] { "Silenciar / activar", "M / F4" },
+                new[] { "Clasificación", "Tab / Esc" },
+                new[] { "Ayuda / cerrar ayuda", "F1 / Esc" },
+                new[] { "Editar iniciales", "A–Z / 0–9" },
+                new[] { "Borrar / guardar nombre", "Retroceso / Enter" },
+                new[] { "Cerrar el resultado", "X / Salir" },
+                new[] { "Pieza fantasma", "Botón ON/OFF" }
+            };
+            for (int i = 0; i < rows.Length; i++)
+            {
+                int rowY = y + 91 + i * 25;
+                if (i % 2 == 0) Fill(g, Color.FromArgb(22, 32, 43), x + 10, rowY - 3, width - 20, 25);
+                Label(g, rows[i][0], x + 18, rowY, compact ? 10 : 14, Ink);
+                Label(g, rows[i][1], x + (compact ? 185 : 385), rowY, compact ? 10 : 14, Cyan);
+            }
+            Label(g, "VOL: barra, +/− o flechas.", x + 18, y + 522, compact ? 11 : 13, Muted);
+            Label(g, "Esc/Enter cierran el volumen.", x + 18, y + 542, compact ? 11 : 13, Muted);
+            Label(g, "Pausa: botón Terminar partida.", x + 18, y + 562, compact ? 11 : 13, Muted);
+            Label(g, "Al escribir iniciales, M y X son letras.", x + 18, y + 582, compact ? 10 : 13, Muted);
+            Label(g, "X cierra el resultado, no la aplicación.", x + 18, y + 599, compact ? 10 : 13, Muted);
         }
 
         private static void Fill(Graphics g, Color color, float x, float y, float w, float h)
@@ -387,13 +556,13 @@ namespace NeonStack
             Fill(g, Lime, 890, 41, 6, 6); Label(g, "ARCADE / OFFLINE", 908, 36, 14, Ink);
             Label(g, "01   /   EDICIÓN DE ESCRITORIO", 846, 76, 12, Muted);
             Line(g, Border, 40, 104, 1060, 104);
-            Label(g, "01 / PUNTUACIÓN", 40, 113, 10, Muted);
+            Label(g, Sprint ? "01 / SPRINT 40" : "01 / PUNTUACIÓN", 40, 113, 10, Muted);
             Label(g, "02 / ZONA DE JUEGO", BoardX, 113, 10, Muted);
             Label(g, "SIGUIENTE", 539, 113, 10, Cyan); ImmediateNext(g, 625, 105, 12);
             Label(g, "03 / SIGUIENTES", 736, 113, 10, Muted);
             Line(g, Border, 40, 760, 1060, 760);
             Fill(g, game.State == Phase.Playing ? Lime : Muted, 41, 784, 5, 5);
-            string state = game.State == Phase.Playing ? "EN JUEGO" : game.State == Phase.Paused ? "EN PAUSA" : game.State == Phase.GameOver ? "FIN DE PARTIDA" : "LISTO PARA JUGAR";
+            string state = game.State == Phase.Playing ? "EN JUEGO" : game.State == Phase.Paused ? "EN PAUSA" : game.State == Phase.Completed ? "40 LINEAS COMPLETADAS" : game.State == Phase.GameOver ? "FIN DE PARTIDA" : "LISTO PARA JUGAR";
             Label(g, state, 55, 778, 12, Ink);
             Label(g, "300 ms para ajustar al tocar el suelo", 359, 778, 12, Muted);
             Label(g, "SIN RED. SOLO TUS RÉCORDS.", 878, 778, 11, Muted);
@@ -402,16 +571,16 @@ namespace NeonStack
         private void DrawStats(Graphics g)
         {
             Panel(g, 40, 132, 308, 170);
-            Label(g, "SCORE", 60, 153, 13, Muted);
-            Pixel(g, game.Score.ToString("D6"), 60, 184, game.Score > 999999 ? 4 : 5, Lime);
+            Label(g, Sprint ? "TIEMPO / OBJETIVO: 40 LÍNEAS" : "SCORE", 60, 153, 13, Muted);
+            Pixel(g, Sprint ? RunTime : game.Score.ToString("D6"), 60, 184, Sprint ? 4 : game.Score > 999999 ? 4 : 5, Lime);
             Line(g, Border, 60, 241, 328, 241);
-            Label(g, "NIVEL", 60, 256, 11, Muted); Label(g, "LÍNEAS", 164, 256, 11, Muted);
-            Pixel(g, game.Level.ToString("D2"), 113, 258, 2, Ink); Pixel(g, game.Lines.ToString("D3"), 220, 258, 2, Ink);
-            Fill(g, Border, 60, 284, 268, 3); Fill(g, Lime, 60, 284, 268 * (game.Lines % 10) / 10f, 3);
+            Label(g, "NIVEL", 60, 256, 11, Muted); Label(g, Sprint ? "FALTAN" : "LÍNEAS", 164, 256, 11, Muted);
+            Pixel(g, game.Level.ToString("D2"), 113, 258, 2, Ink); Pixel(g, (Sprint ? game.RemainingLines : game.Lines).ToString("D3"), 220, 258, 2, Ink);
+            Fill(g, Border, 60, 284, 268, 3); Fill(g, Lime, 60, 284, 268 * (Sprint ? Math.Min(40, game.Lines) / 40f : (game.Lines % 10) / 10f), 3);
 
             Panel(g, 40, 318, 308, 76);
             Label(g, "MEJOR MARCA", 60, 333, 11, Muted);
-            Pixel(g, Math.Max(scores.Best, game.Score).ToString("D6"), 60, 355, 3, Ink);
+            Pixel(g, Sprint ? (Ranking.Count > 0 ? ScoreStore.FormatTime(Ranking[0].Milliseconds.Value) : "--:--.---") : Math.Max(scores.Best, game.Score).ToString("D6"), 60, 355, 3, Ink);
             Pixel(g, "HI", 294, 350, 2, Lime);
 
             Panel(g, 40, 410, 308, 272);
@@ -422,9 +591,9 @@ namespace NeonStack
             {
                 int y = 482 + i * 33;
                 Label(g, (i + 1).ToString("D2"), 60, y, 13, i == 0 ? Lime : Muted);
-                ScoreEntry entry = scores.Data.Entries.Count > i ? scores.Data.Entries[i] : null;
+                ScoreEntry entry = Ranking.Count > i ? Ranking[i] : null;
                 Label(g, entry == null ? "---" : entry.Initials, 103, y, 14, Ink);
-                Label(g, entry == null ? "------" : entry.Score.ToString("D6"), 244, y, 14, entry == null ? Muted : Lime);
+                Label(g, entry == null ? "------" : Sprint ? ScoreStore.FormatTime(entry.Milliseconds.Value) : entry.Score.ToString("D6"), Sprint ? 215 : 244, y, Sprint ? 13 : 14, entry == null ? Muted : Lime);
             }
             Button(g, "records", "VER CLASIFICACION  >", 40, 699, 308, 33, false, 1);
             if (scores.Notice != null) Label(g, "! " + scores.Notice, 40, 742, 10, Colors[4]);
@@ -461,9 +630,12 @@ namespace NeonStack
             }
             if (game.State == Phase.Playing || game.State == Phase.Paused)
             {
-                int ghostY = game.GhostY;
-                foreach (Cell cell in Game.Cells(game.Kind, game.Rotation))
-                    if (ghostY + cell.Y >= 0) Block(g, BoardX + (game.X + cell.X) * Tile, BoardY + (ghostY + cell.Y) * Tile, Tile, game.Kind, true);
+                if (ShowGhost)
+                {
+                    int ghostY = game.GhostY;
+                    foreach (Cell cell in Game.Cells(game.Kind, game.Rotation))
+                        if (ghostY + cell.Y >= 0) Block(g, BoardX + (game.X + cell.X) * Tile, BoardY + (ghostY + cell.Y) * Tile, Tile, game.Kind, true);
+                }
                 foreach (Cell cell in Game.Cells(game.Kind, game.Rotation))
                     if (game.Y + cell.Y >= 0) Block(g, BoardX + (game.X + cell.X) * Tile, BoardY + (game.Y + cell.Y) * Tile, Tile, game.Kind, false);
                 if (game.Grounded)
@@ -518,6 +690,7 @@ namespace NeonStack
             Label(g, "ESC  Pausa     Z  Giro inverso", 756, 621, 12, Muted);
             if (game.State == Phase.Playing || game.State == Phase.Paused)
                 Button(g, "pause", game.State == Phase.Paused ? "CONTINUAR" : "PAUSAR", 736, 672, 324, 60, false, 2);
+            else if (resultsDismissed) Button(g, "start", "NUEVA PARTIDA", 736, 672, 324, 60, false, 2);
             else Label(g, "TUS RÉCORDS SE GUARDAN EN ESTE PC", 751, 693, 12, Muted);
         }
 
@@ -533,13 +706,13 @@ namespace NeonStack
         {
             Fill(g, Color.FromArgb(game.State == Phase.Paused ? 242 : 170, Background), BoardX, BoardY, 300, 600);
             int y = 282;
-            Fill(g, Background, BoardX + 13, y - 27, 274, 289);
+            Fill(g, Background, BoardX + 13, y - 27, 274, game.State == Phase.GameOver || game.State == Phase.Completed ? 330 : 289);
             Line(g, Border, BoardX + 31, y - 27, BoardX + 269, y - 27);
             if (game.State == Phase.Ready)
             {
-                CenterPixel(g, "INSERT", BoardX, y, 300, 4, Ink);
-                CenterPixel(g, "PLAY", BoardX, y + 42, 300, 4, Lime);
-                Label(g, "Encaja. Completa. Supera.", BoardX + 40, y + 97, 15, Muted);
+                CenterPixel(g, Sprint ? "SPRINT" : "INSERT", BoardX, y, 300, 4, Ink);
+                CenterPixel(g, Sprint ? "40" : "PLAY", BoardX, y + 42, 300, 4, Lime);
+                Label(g, Sprint ? "40 líneas. Tu mejor tiempo." : "Encaja. Completa. Supera.", BoardX + 32, y + 97, 15, Muted);
                 Button(g, "start", "JUGAR", BoardX + 38, y + 143, 224, 50, true, 2);
                 CenterPixel(g, "PULSA ENTER", BoardX, y + 215, 300, 1, Muted);
             }
@@ -548,12 +721,13 @@ namespace NeonStack
                 CenterPixel(g, "PAUSA", BoardX, y + 23, 300, 4, Ink);
                 Label(g, "Tómate un respiro.", BoardX + 69, y + 87, 15, Muted);
                 Button(g, "resume", "CONTINUAR", BoardX + 38, y + 143, 224, 50, true, 2);
-                CenterPixel(g, "ESC PARA VOLVER", BoardX, y + 215, 300, 1, Muted);
+                Button(g, "end-run", "TERMINAR PARTIDA", BoardX + 38, y + 205, 224, 32, false, 1);
+                CenterPixel(g, "ESC PARA VOLVER", BoardX, y + 252, 300, 1, Muted);
             }
             else
             {
-                CenterPixel(g, "GAME OVER", BoardX, y - 5, 300, 3, Ink);
-                CenterPixel(g, game.Score.ToString("D6"), BoardX, y + 35, 300, 3, Lime);
+                CenterPixel(g, game.State == Phase.Completed ? "COMPLETADO" : "GAME OVER", BoardX, y - 5, 300, 3, Ink);
+                CenterPixel(g, Sprint ? RunTime : game.Score.ToString("D6"), BoardX, y + 35, 300, 3, Lime);
                 if (editingInitials)
                 {
                     Label(g, "Escribe tus iniciales", BoardX + 56, y + 78, 15, Muted);
@@ -568,12 +742,30 @@ namespace NeonStack
                 }
                 else
                 {
-                    Label(g, "Cada partida cuenta.", BoardX + 62, y + 97, 15, Muted);
+                    Label(g, Sprint && game.State == Phase.GameOver ? "Faltaron " + game.RemainingLines + " líneas." : "Cada partida cuenta.", BoardX + 50, y + 97, 15, Muted);
                     Button(g, "start", "OTRA PARTIDA", BoardX + 26, y + 143, 248, 50, true, 2);
                     CenterPixel(g, "PULSA ENTER", BoardX, y + 215, 300, 1, Muted);
                 }
+                Button(g, "exit", editingInitials ? "SALIR" : "X / SALIR", BoardX + 38, y + 263, 224, 32, false, 1);
             }
             if (toastTime > 0) CenterPixel(g, toast, BoardX - 25, 599, 350, 1, Cyan);
+        }
+
+        private static readonly int[] RecordColumns = { 230, 275, 360, 480, 550, 638, 870 };
+
+        private void RecordCell(Graphics g, string text, int column, int y, Color color)
+        {
+            // Headers and values share their rectangle and alignment, irrespective of
+            // glyph width, score length or the window's render scale.
+            RectangleF rect = new RectangleF(RecordColumns[column], y, RecordColumns[column + 1] - RecordColumns[column] - 12, 20);
+            using (Font font = new Font("Consolas", 13, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (SolidBrush brush = new SolidBrush(color))
+            using (StringFormat format = new StringFormat(StringFormat.GenericTypographic))
+            {
+                format.Alignment = column >= 2 && column <= 4 ? StringAlignment.Far : StringAlignment.Near;
+                format.Trimming = StringTrimming.EllipsisCharacter; format.FormatFlags |= StringFormatFlags.NoWrap;
+                g.DrawString(text, font, brush, rect, format);
+            }
         }
 
         private void DrawRecords(Graphics g)
@@ -581,24 +773,25 @@ namespace NeonStack
             Fill(g, Color.FromArgb(243, Background), 0, 106, CanvasWidth, 651);
             Panel(g, 196, 127, 708, 611);
             Pixel(g, "HALL OF FAME", 230, 151, 3, Lime);
-            Label(g, "TUS 20 MEJORES PARTIDAS / GUARDADO LOCAL", 230, 187, 12, Muted);
-            Label(g, "#    NOMBRE      PUNTOS    NIVEL   LINEAS   FECHA", 230, 222, 14, Muted);
+            Label(g, Sprint ? "SPRINT 40 / LOS 20 MEJORES TIEMPOS / MENOR ES MEJOR" : "CLÁSICO / TUS 20 MEJORES PARTIDAS", 230, 187, 12, Muted);
+            string[] headings = { "#", "NOMBRE", Sprint ? "TIEMPO" : "PUNTOS", "NIVEL", "LINEAS", "FECHA" };
+            for (int column = 0; column < headings.Length; column++) RecordCell(g, headings[column], column, 222, Muted);
             Line(g, Border, 230, 245, 870, 245);
-            if (scores.Data.Entries.Count == 0)
+            if (Ranking.Count == 0)
             {
                 CenterPixel(g, "TU PRIMER RECORD TE ESPERA", 196, 379, 708, 2, Ink);
-                Label(g, "Juega una partida para inaugurar la clasificación.", 305, 423, 14, Muted);
+                Label(g, Sprint ? "Completa 40 líneas para registrar tu tiempo." : "Juega una partida para inaugurar la clasificación.", 305, 423, 14, Muted);
             }
-            for (int i = 0; i < scores.Data.Entries.Count; i++)
+            for (int i = 0; i < Ranking.Count; i++)
             {
-                ScoreEntry e = scores.Data.Entries[i]; int y = 253 + i * 20;
+                ScoreEntry e = Ranking[i]; int y = 253 + i * 20;
                 if (i % 2 == 0) Fill(g, Color.FromArgb(20, 30, 41), 223, y - 1, 647, 20);
-                Label(g, (i + 1).ToString("D2"), 232, y, 13, i == 0 ? Lime : Muted);
-                Label(g, e.Initials, 276, y, 13, Ink);
-                Label(g, e.Score.ToString("D6"), 395, y, 13, Lime);
-                Label(g, e.Level.ToString("D2"), 494, y, 13, Ink);
-                Label(g, e.Lines.ToString("D3"), 565, y, 13, Ink);
-                Label(g, e.Date.ToString("dd/MM/yyyy HH:mm"), 638, y, 13, Muted);
+                RecordCell(g, (i + 1).ToString("D2"), 0, y, i == 0 ? Lime : Muted);
+                RecordCell(g, e.Initials, 1, y, Ink);
+                RecordCell(g, Sprint ? ScoreStore.FormatTime(e.Milliseconds.Value) : e.Score.ToString("D6"), 2, y, Lime);
+                RecordCell(g, e.Level.ToString("D2"), 3, y, Ink);
+                RecordCell(g, e.Lines.ToString("D3"), 4, y, Ink);
+                RecordCell(g, e.Date.ToString("dd/MM/yyyy HH:mm"), 5, y, Muted);
             }
             Button(g, "close-records", "VOLVER  /  ESC", 650, 681, 220, 35, false, 1);
             Label(g, "Sin cuentas. Sin conexión.", 230, 691, 12, Muted);
@@ -607,14 +800,23 @@ namespace NeonStack
         internal void PreparePreview(string mode)
         {
             if (mode.StartsWith("compact")) { SetCompact(true); mode = mode.Replace("compact-", ""); if (mode == "compact") mode = "playing"; }
-            if (mode == "volume") { volumeOpen = true; mode = "playing"; }
+            if (mode.StartsWith("sprint")) { game.SelectMode(GameMode.Sprint40); mode = mode.Replace("sprint-", ""); if (mode == "sprint") mode = "playing"; }
+            bool previewHelp = mode == "help";
+            bool previewVolume = mode == "volume";
             if (mode == "ready") return;
             StartGame();
             int[] heights = { 3, 5, 4, 3, 0, 0, 2, 3, 4, 2 };
             for (int x = 0; x < 10; x++) for (int i = 0; i < heights[x]; i++) game.Board[19 - i, x] = (x / 2 + i) % 7 + 1;
             for (int i = 0; i < 5; i++) game.SoftDrop();
             if (mode == "paused") game.Pause();
-            if (mode == "records") records = true;
+            if (previewVolume) SetVolumeOpen(true);
+            if (previewHelp) SetHelpOpen(true);
+            if (mode == "records") { game.Pause(); records = true; }
+            if (mode == "records-filled")
+            {
+                game.Pause(); records = true;
+                for (int i = 0; i < 20; i++) Ranking.Add(new ScoreEntry { Initials = new[] { "REX", "ACE", "PIX", "NEO" }[i % 4], Score = i == 0 ? 12345678 : 65432 - i * 2345, Milliseconds = Sprint ? (long?)(64234 + i * 5172) : null, Level = Sprint ? 5 : 20 - i, Lines = Sprint ? 40 : (20 - i) * 10 - 1, Date = new DateTime(2026, 9, 7, 18, i, 0) });
+            }
             if (mode == "gameover")
             {
                 for (int i = 0; i < 40 && game.State == Phase.Playing; i++) game.HardDrop();

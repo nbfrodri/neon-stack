@@ -25,3 +25,10 @@ Desktop.ini
 *.sav
 highscores*.json
 scores*.dat
+scores.json
+scores.json.*
+
+# Release packages generated locally
+releases/
+NeonStack-*.zip
+NeonStack-*.sha256

@@ -10,36 +10,29 @@ namespace NeonStack
     internal sealed class Audio : IDisposable
     {
         private readonly bool enabled;
-        private readonly Dictionary<Effect, SoundPlayer> players = new Dictionary<Effect, SoundPlayer>();
-        private readonly List<MemoryStream> streams = new List<MemoryStream>();
-        private int volume = 35;
-        private bool muted;
-        public bool Available { get; private set; }
-        public int Volume { get { return volume; } set { int next = Math.Max(0, Math.Min(100, value)); if (next != volume) { Stop(); Clear(); volume = next; } } }
-        public bool Muted { get { return muted; } set { muted = value; if (value) Stop(); } }
-        public Audio(bool enabled) { this.enabled = enabled; Available = true; }
+        private readonly AudioMixer mixer = new AudioMixer();
+        private WaveOutput output;
+        private bool failed;
+        public bool Available { get { return !failed && (output == null || output.Available); } }
+        public int Volume { get { return mixer.Volume; } set { mixer.Volume = value; } }
+        public bool Muted { get { return mixer.Muted; } set { mixer.Muted = value; } }
+        public Audio(bool enabled) { this.enabled = enabled; }
 
         public void Play(Effect effect)
         {
-            if (!enabled || !Available || muted || volume == 0) return;
+            if (!enabled || !Available || Muted || Volume == 0) return;
             try
             {
-                SoundPlayer player;
-                if (!players.TryGetValue(effect, out player))
-                {
-                    MemoryStream stream = new MemoryStream(Wave(effect, volume), false);
-                    streams.Add(stream); player = new SoundPlayer(stream); player.Load(); players.Add(effect, player);
-                }
-                player.Play();
+                mixer.Play(effect);
+                if (output == null) output = new WaveOutput(mixer);
             }
-            catch (InvalidOperationException) { Available = false; }
-            catch (System.ComponentModel.Win32Exception) { Available = false; }
-            catch (TimeoutException) { Available = false; }
+            catch (InvalidOperationException) { failed = true; }
+            catch (System.ComponentModel.Win32Exception) { failed = true; }
+            catch (DllNotFoundException) { failed = true; }
         }
 
-        public void Stop() { foreach (SoundPlayer player in players.Values) player.Stop(); }
-        private void Clear() { foreach (SoundPlayer player in players.Values) player.Dispose(); players.Clear(); foreach (MemoryStream stream in streams) stream.Dispose(); streams.Clear(); }
-        public void Dispose() { Stop(); Clear(); }
+        public void Stop() { mixer.Stop(); }
+        public void Dispose() { Stop(); if (output != null) output.Dispose(); }
 
         internal static byte[] Wave(Effect effect, int volume)
         {
