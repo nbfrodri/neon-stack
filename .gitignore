@@ -1,0 +1,27 @@
+# Build outputs
+obj/
+bin/
+artifacts/
+dist/
+*.exe
+*.pdb
+*.dll
+*.ilk
+*.obj
+
+# IDE / local
+*.user
+*.suo
+*.userosscache
+.vs/
+.idea/
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local game data (if ever saved next to the repo)
+*.sav
+highscores*.json
+scores*.dat
